@@ -1,10 +1,13 @@
 import os
+import hashlib
+from io import BytesIO
 from typing import Any, Iterator
 
 import pandas as pd
 import streamlit as st
 import yfinance as yf
 from openai import OpenAI
+from pypdf import PdfReader
 
 
 MODEL = "gpt-4o-mini"
@@ -16,9 +19,15 @@ PERIOD_LABELS = {
     "2년": "2y",
 }
 MARKET_SUFFIXES = {"KOSPI": ".KS", "KOSDAQ": ".KQ"}
+MAX_PDF_BYTES = 15 * 1024 * 1024
+MAX_PDF_PAGES = 100
+MAX_PDF_CHARS = 60_000
 BASE_SYSTEM_PROMPT = """
 당신은 한국 주식 데이터 분석을 돕는 친절하고 신중한 AI 어시스턴트입니다.
 아래에 제공된 yfinance 데이터만을 현재 주가 데이터의 근거로 사용하세요.
+PDF 문서가 제공된 경우 해당 문서의 내용만을 문서 관련 답변의 근거로 사용하세요.
+PDF 근거를 사용한 문장에는 가능한 한 [페이지 N] 형식으로 페이지를 표시하세요.
+문서나 데이터에서 확인할 수 없는 내용은 추측하지 말고 확인할 수 없다고 답하세요.
 데이터에 없는 사실이나 실시간 뉴스는 추측하지 말고, 확인할 수 없다고 명시하세요.
 수치에는 가능한 한 기준일을 함께 표시하고 핵심 계산 과정을 간단히 설명하세요.
 답변은 정보 제공 및 교육 목적이며, 확정적인 매수·매도 지시나 수익 보장을 하지 마세요.
@@ -194,17 +203,102 @@ def build_stock_context(
 """.strip()
 
 
+@st.cache_data(show_spinner=False)
+def extract_pdf_text(file_bytes: bytes, file_name: str) -> dict[str, Any]:
+    """Extract page-tagged text from a PDF within safe context limits."""
+    if len(file_bytes) > MAX_PDF_BYTES:
+        raise ValueError("PDF 파일은 최대 15MB까지 업로드할 수 있습니다.")
+
+    reader = PdfReader(BytesIO(file_bytes))
+    if reader.is_encrypted:
+        try:
+            decrypt_result = reader.decrypt("")
+        except Exception as error:
+            raise ValueError("암호화된 PDF는 분석할 수 없습니다.") from error
+        if decrypt_result == 0:
+            raise ValueError("암호가 설정된 PDF는 분석할 수 없습니다.")
+
+    total_pages = len(reader.pages)
+    pages_to_read = min(total_pages, MAX_PDF_PAGES)
+    parts: list[str] = []
+    extracted_chars = 0
+    truncated = total_pages > MAX_PDF_PAGES
+
+    for page_number in range(1, pages_to_read + 1):
+        try:
+            page_text = reader.pages[page_number - 1].extract_text() or ""
+        except Exception:
+            page_text = ""
+        page_text = " ".join(page_text.split())
+        if not page_text:
+            continue
+
+        page_block = f"[페이지 {page_number}]\n{page_text}\n"
+        remaining = MAX_PDF_CHARS - extracted_chars
+        if remaining <= 0:
+            truncated = True
+            break
+        if len(page_block) > remaining:
+            parts.append(page_block[:remaining])
+            extracted_chars += remaining
+            truncated = True
+            break
+        parts.append(page_block)
+        extracted_chars += len(page_block)
+
+    text = "\n".join(parts).strip()
+    if not text:
+        raise ValueError(
+            "추출할 수 있는 텍스트가 없습니다. 스캔 이미지형 PDF라면 OCR 처리가 필요합니다."
+        )
+
+    return {
+        "file_name": file_name,
+        "total_pages": total_pages,
+        "read_pages": pages_to_read,
+        "text": text,
+        "characters": len(text),
+        "truncated": truncated,
+    }
+
+
+def build_pdf_context(pdf_info: dict[str, Any] | None) -> str:
+    if not pdf_info:
+        return "[업로드 PDF]\n업로드된 PDF 없음"
+
+    limit_note = (
+        "분석 한도로 인해 일부 내용이 생략됨"
+        if pdf_info["truncated"]
+        else "전체 추출 범위 포함"
+    )
+    return f"""
+[업로드 PDF]
+- 파일명: {pdf_info['file_name']}
+- 전체 페이지: {pdf_info['total_pages']}
+- 읽은 페이지 범위: 최대 {pdf_info['read_pages']}페이지
+- 추출 문자 수: {pdf_info['characters']:,}
+- 상태: {limit_note}
+
+[PDF 추출 텍스트 시작]
+{pdf_info['text']}
+[PDF 추출 텍스트 끝]
+""".strip()
+
+
 def stream_answer(
     client: OpenAI,
     messages: list[dict[str, str]],
     stock_context: str,
+    pdf_context: str,
 ) -> Iterator[str]:
     stream = client.chat.completions.create(
         model=MODEL,
         messages=[
             {
                 "role": "system",
-                "content": f"{BASE_SYSTEM_PROMPT}\n\n{stock_context}",
+                "content": (
+                    f"{BASE_SYSTEM_PROMPT}\n\n{stock_context}\n\n{pdf_context}"
+                ),
             },
             *messages,
         ],
@@ -225,6 +319,8 @@ if "stock_config" not in st.session_state:
         "period_label": "3개월",
         "symbol": "005930.KS",
     }
+if "pdf_key" not in st.session_state:
+    st.session_state.pdf_key = None
 
 st.title("📈 AI 국내 주식 분석 챗봇")
 st.markdown(
@@ -258,7 +354,7 @@ with st.sidebar:
         submitted = st.form_submit_button(
             "주가 데이터 불러오기",
             type="primary",
-            use_container_width=True,
+            width="stretch",
         )
 
     if submitted:
@@ -278,15 +374,48 @@ with st.sidebar:
             st.rerun()
 
     st.divider()
+    st.header("PDF 문서")
+    uploaded_pdf = st.file_uploader(
+        "분석할 PDF 업로드",
+        type=["pdf"],
+        help="텍스트형 PDF, 최대 15MB·100페이지까지 분석합니다.",
+    )
+    st.caption(
+        "PDF의 텍스트를 추출해 AI 답변의 참고 문서로 사용합니다. "
+        "업로드 파일은 GitHub 저장소에 저장되지 않습니다."
+    )
+
+    st.divider()
     st.caption("AI 모델")
     st.code(MODEL, language=None)
-    if st.button("🗑️ 대화 내용 지우기", use_container_width=True):
+    if st.button("🗑️ 대화 내용 지우기", width="stretch"):
         st.session_state.messages = []
         st.rerun()
     st.caption("주가 데이터는 15분간 캐시된 뒤 다시 조회됩니다.")
 
 config = st.session_state.stock_config
 symbol = config["symbol"]
+
+pdf_info: dict[str, Any] | None = None
+pdf_error: str | None = None
+current_pdf_key: str | None = None
+if uploaded_pdf is not None:
+    pdf_bytes = uploaded_pdf.getvalue()
+    current_pdf_key = (
+        f"{uploaded_pdf.name}:{len(pdf_bytes)}:"
+        f"{hashlib.sha256(pdf_bytes).hexdigest()}"
+    )
+    try:
+        with st.spinner("PDF 텍스트를 추출하는 중입니다..."):
+            pdf_info = extract_pdf_text(pdf_bytes, uploaded_pdf.name)
+    except Exception as error:
+        pdf_error = str(error)
+
+if current_pdf_key != st.session_state.pdf_key:
+    st.session_state.messages = []
+    st.session_state.pdf_key = current_pdf_key
+
+pdf_context = build_pdf_context(pdf_info)
 
 try:
     with st.spinner(f"{symbol} 주가 데이터를 불러오는 중입니다..."):
@@ -319,7 +448,9 @@ st.caption(
     "실시간 시세가 아니며 지연 또는 오류가 있을 수 있습니다."
 )
 
-chart_tab, data_tab, chat_tab = st.tabs(["📊 주가 차트", "🧾 최근 데이터", "💬 AI 분석"])
+chart_tab, data_tab, pdf_tab, chat_tab = st.tabs(
+    ["📊 주가 차트", "🧾 최근 데이터", "📄 PDF 문서", "💬 AI 분석"]
+)
 
 with chart_tab:
     st.line_chart(history["Close"], height=380, color="#10A37F")
@@ -338,8 +469,31 @@ with data_tab:
                 "거래량": "{:,.0f}",
             }
         ),
-        use_container_width=True,
+        width="stretch",
     )
+
+with pdf_tab:
+    if pdf_error:
+        st.error(pdf_error)
+    elif pdf_info:
+        status_columns = st.columns(3)
+        status_columns[0].metric("파일", pdf_info["file_name"])
+        status_columns[1].metric("전체 페이지", f"{pdf_info['total_pages']:,}")
+        status_columns[2].metric("추출 문자", f"{pdf_info['characters']:,}")
+        if pdf_info["truncated"]:
+            st.warning(
+                "분석 한도(최대 100페이지·60,000자)로 인해 문서 일부가 생략되었습니다."
+            )
+        st.success("PDF 텍스트 추출이 완료되어 AI 답변에 반영됩니다.")
+        with st.expander("추출 텍스트 미리보기"):
+            preview = pdf_info["text"][:5_000]
+            st.text(preview + ("\n\n…" if len(pdf_info["text"]) > 5_000 else ""))
+        st.caption(
+            "표·도표·복잡한 레이아웃은 텍스트 추출 과정에서 원본 구조가 "
+            "정확히 유지되지 않을 수 있습니다."
+        )
+    else:
+        st.info("사이드바에서 PDF 파일을 업로드하면 문서 내용을 분석할 수 있습니다.")
 
 with chat_tab:
     st.markdown(
@@ -359,9 +513,14 @@ with chat_tab:
 
     if not st.session_state.messages:
         with st.chat_message("assistant"):
+            pdf_message = (
+                f" 업로드된 **{pdf_info['file_name']}** 문서 내용도 함께 참고할 수 있습니다."
+                if pdf_info
+                else " PDF를 업로드하면 문서 내용에 대해서도 질문할 수 있습니다."
+            )
             st.markdown(
                 f"현재 **{stock_info['name']}({symbol})** 데이터를 불러왔습니다. "
-                "기간 수익률, 변동, 거래량 등에 대해 질문해 보세요."
+                f"기간 수익률, 변동, 거래량 등에 대해 질문해 보세요.{pdf_message}"
             )
 
     for message in st.session_state.messages:
@@ -385,6 +544,7 @@ with chat_tab:
                         client,
                         st.session_state.messages,
                         stock_context,
+                        pdf_context,
                     )
                 )
             except Exception as error:
